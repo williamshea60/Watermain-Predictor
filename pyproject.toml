@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "watermain-predictor"
+version = "0.1.0"
+description = "Backend worker RSS ingestion for watermain signals"
+requires-python = ">=3.10"
+dependencies = [
+  "feedparser>=6.0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
