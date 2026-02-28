@@ -1,16 +1,18 @@
 import logging
 from datetime import datetime, timezone
+from hashlib import sha256
 from types import SimpleNamespace
 
 import feedparser
 import requests
 from sqlalchemy import select
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.jobs.celery_app import celery_app
 from app.jobs.rss_utils import (
-    build_source_id,
     entry_datetime,
     extract_location_text,
     is_duplicate,
@@ -20,7 +22,24 @@ from app.models import Signal
 from app.services.incident_service import IncidentService, SignalPayload
 
 logger = logging.getLogger(__name__)
-USER_AGENT = "Mozilla/5.0 (compatible; WatermainPredictor/1.0; +https://example.com/bot)"
+USER_AGENT = "Mozilla/5.0"
+
+
+def _build_retry_session() -> requests.Session:
+    session = requests.Session()
+    retry_config = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_config)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def _signal_exists(db, *, url: str, source_type: str, source_id: str) -> tuple[bool, bool]:
@@ -36,7 +55,7 @@ def _extract_entry_fields(entry) -> tuple[str, str, str, str, datetime]:
     title = getattr(entry, "title", "") or "(untitled)"
     summary = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
     link = getattr(entry, "link", "")
-    source_id = build_source_id(entry, link)
+    source_id = getattr(entry, "id", None) or (sha256(link.encode("utf-8")).hexdigest() if link else "")
     datetime_entry = SimpleNamespace(
         published=getattr(entry, "published", None),
         updated=getattr(entry, "updated", None),
@@ -56,14 +75,16 @@ def ingest_rss() -> dict:
     inserted = 0
     duplicates = 0
 
+    session = _build_retry_session()
+
     with SessionLocal() as db:
         incident_service = IncidentService(db=db, settings=settings)
 
         for feed_url in rss_urls:
             try:
-                response = requests.get(
+                response = session.get(
                     feed_url,
-                    timeout=(5, 15),
+                    timeout=(5, 20),
                     headers={"User-Agent": USER_AGENT},
                 )
                 response.raise_for_status()
@@ -90,7 +111,7 @@ def ingest_rss() -> dict:
                     duplicates += 1
                     continue
 
-                extracted_text = "\n\n".join(part for part in (title, summary) if part)
+                extracted_text = "\n".join((title, summary)).strip()
                 features = {
                     "feed_url": feed_url,
                     "source": "rss",
@@ -107,6 +128,8 @@ def ingest_rss() -> dict:
                     latitude=0.0,
                     longitude=0.0,
                 )
+                # RSS ingestion should not depend on geocoding. We ingest with
+                # a neutral coordinate and let downstream enrichment improve it.
                 signal = incident_service.ingest_signal(payload)
                 signal.created_at = published_at
                 signal.fetched_at = datetime.now(timezone.utc)
@@ -115,6 +138,8 @@ def ingest_rss() -> dict:
                 signal.features = features
                 db.commit()
                 inserted += 1
+
+    session.close()
 
     logger.info(
         "RSS ingest completed: feeds_ok=%s feeds_failed=%s items_seen=%s inserted=%s duplicates=%s",
