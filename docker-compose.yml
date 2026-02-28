@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/waterbreak
+      REDIS_URL: redis://redis:6379/0
+      RSS_URLS: https://example.com/feed.xml
+      REDDIT_SUBREDDITS: toronto
+    depends_on:
+      - db
+      - redis
+
+  worker:
+    build: .
+    command: celery -A app.jobs.celery_app.celery_app worker -l info
+    volumes:
+      - .:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/waterbreak
+      REDIS_URL: redis://redis:6379/0
+      RSS_URLS: https://example.com/feed.xml
+      REDDIT_SUBREDDITS: toronto
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: waterbreak
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
