@@ -1,6 +1,9 @@
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import feedparser
+import requests
 from sqlalchemy import select
 
 from app.core.config import get_settings
@@ -12,12 +15,12 @@ from app.jobs.rss_utils import (
     extract_location_text,
     is_duplicate,
     keyword_hits,
-    parse_feed,
 )
 from app.models import Signal
 from app.services.incident_service import IncidentService, SignalPayload
 
 logger = logging.getLogger(__name__)
+USER_AGENT = "Mozilla/5.0 (compatible; WatermainPredictor/1.0; +https://example.com/bot)"
 
 
 def _signal_exists(db, *, url: str, source_type: str, source_id: str) -> tuple[bool, bool]:
@@ -28,49 +31,69 @@ def _signal_exists(db, *, url: str, source_type: str, source_id: str) -> tuple[b
     return url_match, source_match
 
 
+def _extract_entry_fields(entry) -> tuple[str, str, str, str, datetime]:
+    now = datetime.now(timezone.utc)
+    title = getattr(entry, "title", "") or "(untitled)"
+    summary = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+    link = getattr(entry, "link", "")
+    source_id = build_source_id(entry, link)
+    datetime_entry = SimpleNamespace(
+        published=getattr(entry, "published", None),
+        updated=getattr(entry, "updated", None),
+    )
+    published_at = entry_datetime(datetime_entry, now)
+    return title, summary, link, source_id, published_at
+
+
 @celery_app.task(name="jobs.ingest_rss")
 def ingest_rss() -> dict:
     settings = get_settings()
     rss_urls = [url.strip() for url in settings.rss_urls.split(",") if url.strip()]
 
-    feeds_fetched = 0
-    items_processed = 0
-    signals_inserted = 0
-    signals_skipped = 0
+    feeds_ok = 0
+    feeds_failed = 0
+    items_seen = 0
+    inserted = 0
+    duplicates = 0
 
     with SessionLocal() as db:
         incident_service = IncidentService(db=db, settings=settings)
 
         for feed_url in rss_urls:
-            parsed = parse_feed(feed_url)
+            try:
+                response = requests.get(
+                    feed_url,
+                    timeout=(5, 15),
+                    headers={"User-Agent": USER_AGENT},
+                )
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                logger.warning("Failed to fetch RSS feed source=%s error=%s", feed_url, exc)
+                feeds_failed += 1
+                continue
+
+            parsed = feedparser.parse(response.content)
             if parsed.bozo:
                 logger.warning("Feed parse warning for source=%s: %s", feed_url, parsed.bozo_exception)
-            feeds_fetched += 1
+            feeds_ok += 1
 
             for entry in parsed.entries:
-                items_processed += 1
-                now = datetime.now(timezone.utc)
-
-                title = entry.title or "(untitled)"
-                summary = entry.summary
-                link = entry.link
+                items_seen += 1
+                title, summary, link, source_id, published_at = _extract_entry_fields(entry)
 
                 if not link:
-                    signals_skipped += 1
                     continue
 
                 source_type = "rss"
-                source_id = build_source_id(entry, link)
-
                 url_match, source_match = _signal_exists(db, url=link, source_type=source_type, source_id=source_id)
                 if is_duplicate(url_match=url_match, source_match=source_match):
-                    signals_skipped += 1
+                    duplicates += 1
                     continue
 
-                published_at = entry_datetime(entry, now)
                 extracted_text = "\n\n".join(part for part in (title, summary) if part)
                 features = {
                     "feed_url": feed_url,
+                    "source": "rss",
                     "keyword_hits": keyword_hits(extracted_text),
                 }
 
@@ -86,26 +109,28 @@ def ingest_rss() -> dict:
                 )
                 signal = incident_service.ingest_signal(payload)
                 signal.created_at = published_at
-                signal.fetched_at = now
+                signal.fetched_at = datetime.now(timezone.utc)
                 signal.extracted_text = extracted_text
                 signal.extracted_location_text = extract_location_text(extracted_text)
                 signal.features = features
                 db.commit()
-                signals_inserted += 1
+                inserted += 1
 
     logger.info(
-        "RSS ingest completed: feeds_fetched=%s items_processed=%s signals_inserted=%s signals_skipped=%s",
-        feeds_fetched,
-        items_processed,
-        signals_inserted,
-        signals_skipped,
+        "RSS ingest completed: feeds_ok=%s feeds_failed=%s items_seen=%s inserted=%s duplicates=%s",
+        feeds_ok,
+        feeds_failed,
+        items_seen,
+        inserted,
+        duplicates,
     )
     return {
         "status": "ok",
-        "feeds_fetched": feeds_fetched,
-        "items_processed": items_processed,
-        "signals_inserted": signals_inserted,
-        "signals_skipped": signals_skipped,
+        "feeds_ok": feeds_ok,
+        "feeds_failed": feeds_failed,
+        "items_seen": items_seen,
+        "inserted": inserted,
+        "duplicates": duplicates,
     }
 
 
