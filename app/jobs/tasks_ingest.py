@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone
 from hashlib import sha256
 from types import SimpleNamespace
@@ -6,8 +7,6 @@ from types import SimpleNamespace
 import feedparser
 import requests
 from sqlalchemy import select
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
@@ -23,23 +22,32 @@ from app.services.incident_service import IncidentService, SignalPayload
 
 logger = logging.getLogger(__name__)
 USER_AGENT = "Mozilla/5.0"
+RETRY_ATTEMPTS = 3
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
-def _build_retry_session() -> requests.Session:
-    session = requests.Session()
-    retry_config = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry_config)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+def _fetch_feed(session: requests.Session, feed_url: str) -> requests.Response:
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            response = session.get(
+                feed_url,
+                timeout=(5, 20),
+                headers={"User-Agent": USER_AGENT},
+            )
+        except requests.Timeout:
+            if attempt == RETRY_ATTEMPTS:
+                raise
+            time.sleep(2 ** (attempt - 1))
+            continue
+
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < RETRY_ATTEMPTS:
+            time.sleep(2 ** (attempt - 1))
+            continue
+
+        response.raise_for_status()
+        return response
+
+    raise RuntimeError(f"Exhausted retries for RSS feed: {feed_url}")
 
 
 def _signal_exists(db, *, url: str, source_type: str, source_id: str) -> tuple[bool, bool]:
@@ -75,19 +83,14 @@ def ingest_rss() -> dict:
     inserted = 0
     duplicates = 0
 
-    session = _build_retry_session()
+    session = requests.Session()
 
     with SessionLocal() as db:
         incident_service = IncidentService(db=db, settings=settings)
 
         for feed_url in rss_urls:
             try:
-                response = session.get(
-                    feed_url,
-                    timeout=(5, 20),
-                    headers={"User-Agent": USER_AGENT},
-                )
-                response.raise_for_status()
+                response = _fetch_feed(session, feed_url)
             except requests.RequestException as exc:
                 logger.warning("Failed to fetch RSS feed source=%s error=%s", feed_url, exc)
                 feeds_failed += 1
